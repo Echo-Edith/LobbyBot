@@ -259,6 +259,9 @@ async def on_message(message: discord.Message):
         # 4. Route Execution metrics straight to the private log channel
         log_channel = bot.get_channel(config["log_channel_id"])
         if log_channel:
+            cb = "```"
+            captured_preview = f"{cb}text\n{message.content[:200]}\n{cb}"
+            
             report = discord.Embed(
                 title="🛡️ TRIPWIRE INTERCEPTION INFLICTED",
                 color=discord.Color.dark_orange(),
@@ -266,5 +269,21 @@ async def on_message(message: discord.Message):
             )
             report.add_field(name="Account Caught", value=f"{offender.mention} (`{offender.id}`)", inline=True)
             report.add_field(name="Enforcement Action", value=f"`{action_type.upper()}`", inline=True)
-            report.add_field(name="Captured Content", value=f"
+            report.add_field(name="Captured Content", value=captured_preview, inline=False)
+            await log_channel.send(embed=report)
 
+    except discord.Forbidden:
+        log_channel = bot.get_channel(config["log_channel_id"])
+        if log_channel:
+            await log_channel.send(f"❌ **CRITICAL OPERATION FAILURE:** I tried to execute moderation on {offender.mention}, but my role is lower than theirs in server settings. Go to Server Settings > Roles and drag my role to the top!")
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        await interaction.response.send_message("❌ Access Denied: This command requires Administrator access privileges.", ephemeral=True)
+    else:
+        print(f"Unhandled app command error exception: {error}")
+
+if __name__ == "__main__":
+    keep_alive()
+    bot.run(os.getenv("DISCORD_TOKEN"))
