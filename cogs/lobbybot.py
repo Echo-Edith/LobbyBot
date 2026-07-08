@@ -16,12 +16,13 @@ class LobbyBot(commands.Cog):
         self.cycle_status.cancel()
 
     # ==========================================================
-    # STORAGE MANAGEMENT (SQLite)
+    # STORAGE MANAGEMENT (SQLite - Auto-Migrating Columns)
     # ==========================================================
     def init_db(self):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        # Updates table layout to safely hold multiple role IDs as a split-string
+        
+        # Create core tables if they do not exist
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS vc_config (
                 guild_id INTEGER PRIMARY KEY,
@@ -35,6 +36,21 @@ class LobbyBot(commands.Cog):
                 guild_id INTEGER
             )
         ''')
+        
+        # ROBUST MIGRATION: Check if old database file exists without the new column
+        cursor.execute("PRAGMA table_info(vc_config)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        # If database is old, safely migrate columns to prevent silent SQL crashes!
+        if "allowed_role_id" in columns and "allowed_role_ids" not in columns:
+            try:
+                cursor.execute("ALTER TABLE vc_config ADD COLUMN allowed_role_ids TEXT")
+                cursor.execute("UPDATE vc_config SET allowed_role_ids = CAST(allowed_role_id AS TEXT)")
+                conn.commit()
+                print("⚙️ SQLite: Successfully migrated allowed_role_id to allowed_role_ids.")
+            except Exception as e:
+                print(f"❌ Migration error: {e}")
+                
         conn.commit()
         conn.close()
 
@@ -81,24 +97,31 @@ class LobbyBot(commands.Cog):
         return rows
 
     # ==========================================================
-    # DYNAMIC STATUS CYCLER (Includes your custom requested presence)
+    # BOT-ONLY DYNAMIC STATUS CYCLER (NO GAMES)
     # ==========================================================
     STATUS_LIST = [
-        "Managing VC", "Apex Legends", "Valorant", "Minecraft", 
-        "League of Legends", "Grand Theft Auto V", "Counter-Strike 2", 
-        "GTA 6", "Call of Duty: Warzone", "Watching for ghost VC", "Roblox",
-        "Managing Ephemeral VCs", "LobbyBot Online ✅", "Cleaning ghost channels..."
+        "LobbyBot Status: Online",
+        "Managing Ephemeral VCs",
+        "Cleaning empty voice rooms...",
+        "Monitoring active voice channels",
+        "Securing dynamic voice sectors",
+        "Watching channel capacity limits",
+        "Clearing ghost channels...",
+        "Managing temporary VCs",
+        "Restricting voice boundaries",
+        "Optimizing database records...",
+        "Securing server voice routes"
     ]
 
     @tasks.loop(seconds=20)
     async def cycle_status(self):
-        """Randomly changes status activity to keep client layout dynamic."""
+        """Randomly changes status activity to bot-centric custom statuses only."""
         await self.bot.wait_until_ready()
         status_phrase = random.choice(self.STATUS_LIST)
         
-        # Standard custom presence format matching the preview
+        # Standard custom presence format showing purely the status phrase
         await self.bot.change_presence(
-            activity=discord.Activity(type=discord.ActivityType.playing, name=status_phrase)
+            activity=discord.CustomActivity(name=status_phrase)
         )
 
     # ==========================================================
@@ -238,3 +261,4 @@ class LobbyBot(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(LobbyBot(bot))
+
