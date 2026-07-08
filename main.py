@@ -3,9 +3,10 @@ import discord
 from discord.ext import commands
 from keep_alive import keep_alive
 
-# We only need default intents and voice_states for ephemeral channels
+# Enabling intents since you have them turned on in the developer portal!
 intents = discord.Intents.default()
 intents.voice_states = True     
+intents.message_content = True  
 
 class LobbyBotClient(commands.Bot):
     def __init__(self):
@@ -25,25 +26,22 @@ bot = LobbyBotClient()
 async def on_ready():
     print(f"🛡️ LobbyBot Startup Initialized: {bot.user}")
     
-    # Force an immediate sync of all slash commands globally on startup
+    # 1. Sync globally (takes some time to register everywhere)
     try:
-        synced = await bot.tree.sync()
-        print(f"🔄 Successfully synced {len(synced)} slash commands globally.")
+        global_synced = await bot.tree.sync()
+        print(f"🔄 Synced {len(global_synced)} commands globally.")
     except Exception as e:
-        print(f"❌ Global synchronization error: {e}")
+        print(f"❌ Global sync error: {e}")
 
-# This command allows you to manually force-sync your commands instantly if they are laggy
-@bot.command(name="sync")
-@commands.is_owner()
-async def force_sync(ctx):
-    """Admin command: type /sync in standard chat to force-sync commands to your current guild instantly."""
-    try:
-        # Syncs specifically to the server you typed the command in
-        bot.tree.copy_global_to(guild=ctx.guild)
-        synced = await bot.tree.sync(guild=ctx.guild)
-        await ctx.send(f"⚡ Instant Sync Complete! Synced {len(synced)} commands to this server. Try using /open-vc now!")
-    except Exception as e:
-        await ctx.send(f"❌ Local sync failed: {e}")
+    # 2. Instant Sync to all guilds (makes commands show up immediately!)
+    print("⚡ Performing instant sync on all connected servers...")
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"✅ Instantly synced {len(synced)} commands to server: {guild.name} ({guild.id})")
+        except Exception as e:
+            print(f"❌ Failed instant sync for server {guild.name}: {e}")
 
 if __name__ == "__main__":
     keep_alive()
