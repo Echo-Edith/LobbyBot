@@ -3,22 +3,29 @@ import discord
 from discord.ext import commands
 from keep_alive import keep_alive
 
-# Enabling required gateway intents (voice and messages)
+# Enabling required gateway intents (voice, guild, and message content)
 intents = discord.Intents.default()
 intents.voice_states = True     
 intents.message_content = True  
+intents.guilds = True
 
 class LobbyBotClient(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="/", intents=intents)
 
     async def setup_hook(self):
-        """Loads the lobbybot extension from the cogs folder before connecting."""
+        """Loads all extensions before connecting."""
         try:
             await self.load_extension("cogs.lobbybot")
             print("📁 Loaded 'cogs.lobbybot' successfully.")
         except Exception as e:
-            print(f"❌ Failed to load cog: {e}")
+            print(f"❌ Failed to load lobbybot cog: {e}")
+            
+        try:
+            await self.load_extension("cogs.music")
+            print("📁 Loaded 'cogs.music' successfully.")
+        except Exception as e:
+            print(f"📁 Note: Music cog not loaded or running limited fallback: {e}")
 
 bot = LobbyBotClient()
 
@@ -27,9 +34,7 @@ async def on_ready():
     print(f"🛡️ LobbyBot Startup Initialized: {bot.user}")
     print(f"Connected to {len(bot.guilds)} servers.")
     
-    # Clean Global Sync (Resolves Double Commands & Rate-Limit status crashes):
-    # We only sync globally once. We DO NOT sync or clear individual guilds in a loop.
-    # This keeps startup incredibly fast and lets the status cycler run instantly.
+    # Clean Global Sync (Only once on startup - keeps the badge active and removes duplicates)
     print("🌍 Syncing commands globally...")
     try:
         global_synced = await bot.tree.sync()
