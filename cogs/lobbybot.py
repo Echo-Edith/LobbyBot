@@ -84,9 +84,9 @@ class LobbyBot(commands.Cog):
     # DYNAMIC STATUS CYCLER (Includes your custom requested presence)
     # ==========================================================
     STATUS_LIST = [
-        "Luring in spammers!", "Apex Legends", "Valorant", "Minecraft", 
+        "Managing VC", "Apex Legends", "Valorant", "Minecraft", 
         "League of Legends", "Grand Theft Auto V", "Counter-Strike 2", 
-        "Fortnite", "Call of Duty: Warzone", "Dota 2", "Roblox",
+        "GTA 6", "Call of Duty: Warzone", "Watching for ghost VC", "Roblox",
         "Managing Ephemeral VCs", "LobbyBot Online ✅", "Cleaning ghost channels..."
     ]
 
