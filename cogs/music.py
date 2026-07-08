@@ -12,16 +12,34 @@ class Music(commands.Cog):
         bot.loop.create_task(self.connect_nodes())
 
     async def connect_nodes(self):
+        """Tries multiple high-uptime servers one by one until one successfully connects."""
         await self.bot.wait_until_ready()
-        node = wavelink.Node(
-            uri="http://lava.link:80",
-            password="youshallnotpass"
-        )
-        try:
-            await wavelink.Pool.connect(nodes=[node], client=self.bot, cache_capacity=100)
-            print("🟢 Wavelink connected to 24/7 public node pool!")
-        except Exception as e:
-            print(f"⚠️ Connection error: {e}")
+        
+        # List of the best 4 free public music servers online right now
+        servers = [
+            {"uri": "http://lavalink.yandere.today:2333", "password": "yanderetoday"},
+            {"uri": "http://lava.link:80", "password": "youshallnotpass"},
+            {"uri": "http://ll.gsl.network:80", "password": "youshallnotpass"},
+            {"uri": "http://lavalink.jirayu.xyz:2333", "password": "youshallnotpass"}
+        ]
+        
+        connected = False
+        for server_info in servers:
+            node = wavelink.Node(
+                uri=server_info["uri"],
+                password=server_info["password"]
+            )
+            try:
+                # Try to connect to this single node
+                await wavelink.Pool.connect(nodes=[node], client=self.bot, cache_capacity=100)
+                print(f"🟢 Connected successfully to: {server_info['uri']}")
+                connected = True
+                break  # Stop trying other servers once we are connected!
+            except Exception as e:
+                print(f"⚠️ Failed to connect to {server_info['uri']}: {e}. Trying fallback...")
+        
+        if not connected:
+            print("❌ Critical: All fallback music servers are currently unreachable.")
 
     @commands.Cog.listener()
     async def on_wavelink_node_ready(self, node: wavelink.Node):
@@ -51,6 +69,7 @@ class Music(commands.Cog):
 
     @commands.command(name="mp", aliases=["play"])
     async def mp_command(self, ctx: commands.Context, *, query: str = None):
+        """Prefix command: !mp [song name]"""
         if not query:
             return await ctx.send("❌ Please specify a song! Example: `!mp Starboy`")
 
@@ -62,6 +81,7 @@ class Music(commands.Cog):
 
         if not player:
             try:
+                # Bypass channel user limits to join
                 overwrites = voice_channel.overwrites
                 overwrites[ctx.guild.me] = discord.PermissionOverwrite(connect=True, speak=True)
                 await voice_channel.edit(overwrites=overwrites)
@@ -105,6 +125,7 @@ class Music(commands.Cog):
 
     @commands.command(name="mq", aliases=["queue"])
     async def mq_command(self, ctx: commands.Context):
+        """Prefix command: !mq"""
         player: wavelink.Player = ctx.voice_client or ctx.guild.voice_client
         if not player or not player.current:
             return await ctx.send("❌ Nothing is currently playing.")
@@ -136,6 +157,7 @@ class Music(commands.Cog):
 
     @commands.command(name="mskip", aliases=["skip"])
     async def skip_command(self, ctx: commands.Context):
+        """Prefix command: !mskip"""
         player: wavelink.Player = ctx.voice_client or ctx.guild.voice_client
         if not player or not player.current:
             return await ctx.send("❌ Nothing is playing to skip.")
@@ -167,6 +189,7 @@ class Music(commands.Cog):
 
     @commands.command(name="mstop", aliases=["stop"])
     async def stop_command(self, ctx: commands.Context):
+        """Prefix command: !mstop"""
         player: wavelink.Player = ctx.voice_client or ctx.guild.voice_client
         if player:
             player.queue.clear()
