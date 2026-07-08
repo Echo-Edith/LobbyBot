@@ -21,11 +21,12 @@ class LobbyBot(commands.Cog):
     def init_db(self):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
+        # Updates table layout to safely hold multiple role IDs as a split-string
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS vc_config (
                 guild_id INTEGER PRIMARY KEY,
                 restricted_mode TEXT,
-                allowed_role_id INTEGER
+                allowed_role_ids TEXT
             )
         ''')
         cursor.execute('''
@@ -37,25 +38,25 @@ class LobbyBot(commands.Cog):
         conn.commit()
         conn.close()
 
-    def save_vc_config(self, guild_id, restricted_mode, allowed_role_id):
+    def save_vc_config(self, guild_id, restricted_mode, allowed_role_ids_str):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO vc_config (guild_id, restricted_mode, allowed_role_id)
+            INSERT OR REPLACE INTO vc_config (guild_id, restricted_mode, allowed_role_ids)
             VALUES (?, ?, ?)
-        ''', (guild_id, restricted_mode, allowed_role_id))
+        ''', (guild_id, restricted_mode, allowed_role_ids_str))
         conn.commit()
         conn.close()
 
     def get_vc_config(self, guild_id):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute('SELECT restricted_mode, allowed_role_id FROM vc_config WHERE guild_id = ?', (guild_id,))
+        cursor.execute('SELECT restricted_mode, allowed_role_ids FROM vc_config WHERE guild_id = ?', (guild_id,))
         row = cursor.fetchone()
         conn.close()
         if row:
-            return {"restricted_mode": row[0], "allowed_role_id": row[1]}
-        return {"restricted_mode": "everyone", "allowed_role_id": 0}
+            return {"restricted_mode": row[0], "allowed_role_ids": row[1]}
+        return {"restricted_mode": "everyone", "allowed_role_ids": ""}
 
     def add_ephemeral_vc(self, channel_id, guild_id):
         conn = sqlite3.connect(DB_FILE)
@@ -80,78 +81,83 @@ class LobbyBot(commands.Cog):
         return rows
 
     # ==========================================================
-    # 100 DYNAMIC STATUS PHRASES
+    # DYNAMIC STATUS CYCLER (Includes your custom requested presence)
     # ==========================================================
     STATUS_LIST = [
-        "Apex Legends", "Valorant", "Minecraft", "League of Legends", "Grand Theft Auto V",
-        "Counter-Strike 2", "Fortnite", "Call of Duty: Warzone", "Dota 2", "Roblox",
-        "Cyberpunk 2077", "Elden Ring", "Rust", "Lethal Company", "Rocket League",
-        "Baldur's Gate 3", "Overwatch 2", "Helldivers 2", "The Sims 4", "Dead by Daylight",
-        "Team Fortress 2", "Tom Clancy's Rainbow Six Siege", "Stardew Valley", "Terraria", "Sea of Thieves",
-        "Phasmophobia", "Among Us", "Palworld", "Destiny 2", "Genshin Impact",
-        "Honkai: Star Rail", "World of Warcraft", "Diablo IV", "ARK: Survival Ascended", "PUBG: BATTLEGROUNDS",
-        "The Finals", "Geometry Dash", "Monopoly GO!", "Subnautica", "Hollow Knight",
-        "Red Dead Redemption 2", "The Witcher 3: Wild Hunt", "Assassin's Creed Valhalla", "Fallout 4", "Skyrim",
-        "Sons of the Forest", "Garry's Mod", "Forza Horizon 5", "FIFA 24", "Madden NFL 24",
-        "NBA 2K24", "Hogwarts Legacy", "Starfield", "Payday 3", "Dead Island 2",
-        "Lobby 1", "Lobby 2", "Main Lounge", "Chilling in VC 1", "Active Matchmaking",
-        "Queue Simulator", "Custom Games", "Competitive Rank-up", "Scrims Lobby", "Tournaments Core",
-        "Analyzing member join rates...", "Cleaning ghost channels...", "Securing dynamic VCs...", "Restricting permissions...", "Owner safety matrix active...",
-        "Optimizing server configs...", "LobbyBot | Version 2.0", "Managing Ephemeral VCs", "Hosting custom matches", "Counting active players",
-        "Securing voice routes", "Watching community chat", "Guarding the entrance", "Tracking user limits", "Wiping empty channels",
-        "Waiting for players to join", "LobbyBot Live", "Detecting bot raids", "Analyzing token traffic", "Deploying dynamic zones",
-        "Configuring voice sectors", "Managing administrative VCs", "Lobby system standard verification", "Keeping server safe", "Scanning invite links",
-        "Updating SQLite records", "Exempt role verified", "Lounge setup active", "Locking channel boundaries", "Monitoring voice ping",
-        "Restricting VC access", "LobbyBot Online ✅", "Listening for VC join triggers"
+        "Luring in spammers!", "Apex Legends", "Valorant", "Minecraft", 
+        "League of Legends", "Grand Theft Auto V", "Counter-Strike 2", 
+        "Fortnite", "Call of Duty: Warzone", "Dota 2", "Roblox",
+        "Managing Ephemeral VCs", "LobbyBot Online ✅", "Cleaning ghost channels..."
     ]
 
     @tasks.loop(seconds=20)
     async def cycle_status(self):
-        """Loops through the statuses dynamically to keep the bot looking active."""
+        """Randomly changes status activity to keep client layout dynamic."""
         await self.bot.wait_until_ready()
         status_phrase = random.choice(self.STATUS_LIST)
-        await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.playing, name=status_phrase))
+        
+        # Standard custom presence format matching the preview
+        await self.bot.change_presence(
+            activity=discord.Activity(type=discord.ActivityType.playing, name=status_phrase)
+        )
 
     # ==========================================================
-    # VC RESTRICTIONS AND EPHEMERAL VC CREATOR
+    # MODIFIED /RESTRICT-VC (Supports multi-role permission config)
     # ==========================================================
     @app_commands.command(
         name="restrict-vc",
-        description="Set permissions on who is allowed to generate ephemeral VCs inside this server."
+        description="Configure access permissions for temporary VC creation."
     )
     @app_commands.describe(
         mode="Who is allowed to run the /open-vc command?",
-        exempt_role="The specific role allowed to create voice channels if 'Specific Role' mode is set."
+        role_1="First role allowed to create voice channels.",
+        role_2="Second role allowed to create voice channels (Optional).",
+        role_3="Third role allowed to create voice channels (Optional).",
+        role_4="Fourth role allowed to create voice channels (Optional)."
     )
     @app_commands.choices(
         mode=[
             app_commands.Choice(name="Everyone (No Restrictions)", value="everyone"),
             app_commands.Choice(name="Administrators Only", value="admin"),
-            app_commands.Choice(name="Specific Allowed Role Only", value="role")
+            app_commands.Choice(name="Allowed Roles List Only", value="role")
         ]
     )
     async def restrict_vc_command(
         self,
         interaction: discord.Interaction,
         mode: app_commands.Choice[str],
-        exempt_role: discord.Role = None
+        role_1: discord.Role = None,
+        role_2: discord.Role = None,
+        role_3: discord.Role = None,
+        role_4: discord.Role = None
     ):
         guild = interaction.guild
         if interaction.user.id != guild.owner_id and not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message("❌ Error: Only the Server Owner or Server Administrators can configure voice restrictions.", ephemeral=True)
+            return await interaction.response.send_message("❌ Error: Only Administrators can configure voice restrictions.", ephemeral=True)
 
-        if mode.value == "role" and not exempt_role:
-            return await interaction.response.send_message("❌ Setup Error: You chose 'Specific Allowed Role Only' but did not provide a role in the `exempt_role` option.", ephemeral=True)
+        if mode.value == "role" and not role_1:
+            return await interaction.response.send_message("❌ Setup Error: You selected 'Allowed Roles List Only' but did not supply a role inside the `role_1` field.", ephemeral=True)
 
-        allowed_role_id = exempt_role.id if exempt_role else 0
-        self.save_vc_config(guild.id, mode.value, allowed_role_id)
+        # Build list of active provided role IDs
+        collected_ids = []
+        role_mentions = []
+        for r in [role_1, role_2, role_3, role_4]:
+            if r:
+                collected_ids.append(str(r.id))
+                role_mentions.append(r.mention)
+        
+        allowed_roles_str = ",".join(collected_ids)
+        self.save_vc_config(guild.id, mode.value, allowed_roles_str)
 
-        msg = f"✅ Success! `/open-vc` has been restricted to: **{mode.name}**"
-        if exempt_role:
-            msg += f" ({exempt_role.mention})"
+        msg = f"✅ Success! `/open-vc` access has been configured to: **{mode.name}**"
+        if role_mentions:
+            msg += f"\n👥 **Allowed Roles:** {', '.join(role_mentions)}"
         
         await interaction.response.send_message(msg, ephemeral=True)
 
+    # ==========================================================
+    # UPGRADED /OPEN-VC (Renders a beautiful Rich Embed UI notification)
+    # ==========================================================
     @app_commands.command(
         name="open-vc",
         description="Spawns a temporary ephemeral Voice Channel that deletes itself when empty."
@@ -166,21 +172,25 @@ class LobbyBot(commands.Cog):
 
         config = self.get_vc_config(guild.id)
         restricted_mode = config["restricted_mode"]
-        allowed_role_id = config["allowed_role_id"]
+        allowed_roles_str = config["allowed_role_ids"]
 
-        if interaction.user.id != guild.owner_id:
-            if restricted_mode == "admin" and not interaction.user.guild_permissions.administrator:
+        # Permission check evaluation supporting multiple roles
+        if interaction.user.id != guild.owner_id and not interaction.user.guild_permissions.administrator:
+            if restricted_mode == "admin":
                 return await interaction.followup.send("❌ Permission Denied: This command is restricted to Server Administrators.", ephemeral=True)
             elif restricted_mode == "role":
-                user_has_role = any(role.id == allowed_role_id for role in interaction.user.roles)
-                if not user_has_role and not interaction.user.guild_permissions.administrator:
-                    allowed_role_obj = guild.get_role(allowed_role_id)
-                    role_name = allowed_role_obj.name if allowed_role_obj else "the configured exempt role"
-                    return await interaction.followup.send(f"❌ Permission Denied: You must have the `{role_name}` role to create voice channels.", ephemeral=True)
+                if not allowed_roles_str:
+                    return await interaction.followup.send("❌ Permission Denied: No roles are allowed to create channels yet.", ephemeral=True)
+                
+                allowed_role_ids = [int(x) for x in allowed_roles_str.split(",") if x.strip().isdigit()]
+                user_has_allowed_role = any(role.id in allowed_role_ids for role in interaction.user.roles)
+                if not user_has_allowed_role:
+                    return await interaction.followup.send("❌ Permission Denied: You do not possess an authorized role to generate dynamic voice rooms.", ephemeral=True)
 
         clean_limit = max(0, min(99, user_limit))
 
         try:
+            # Create voice channel
             new_vc = await guild.create_voice_channel(
                 name=name.strip(),
                 user_limit=clean_limit,
@@ -188,9 +198,26 @@ class LobbyBot(commands.Cog):
             )
             
             self.add_ephemeral_vc(new_vc.id, guild.id)
-            await interaction.followup.send(f"🔊 Your ephemeral Voice Channel {new_vc.mention} is ready! It will delete when everyone leaves.", ephemeral=True)
+            
+            # Formulate the Discord Embed Message
+            embed = discord.Embed(
+                title="🔊 Ephemeral Voice Channel Opened!",
+                description="A new dynamic room has been established.",
+                color=discord.Color.gold()
+            )
+            embed.add_field(name="👑 Creator", value=interaction.user.mention, inline=True)
+            embed.add_field(name="🏷️ Channel Name", value=f"**{new_vc.name}**", inline=True)
+            embed.add_field(name="👥 Capacity Limit", value="Unlimited" if clean_limit == 0 else f"{clean_limit} users", inline=True)
+            embed.add_field(name="🔗 Quick Join", value=f"[Click Here to Join Room]({new_vc.jump_url})", inline=False)
+            embed.set_footer(text="This channel will automatically self-destruct once empty.")
+            embed.set_thumbnail(url=interaction.user.display_avatar.url if interaction.user.display_avatar else None)
+
+            # Confirm privately to the command caller, and send a beautiful public embed to the text channel
+            await interaction.followup.send("✅ Voice channel opened successfully!", ephemeral=True)
+            await interaction.channel.send(embed=embed)
+
         except discord.Forbidden:
-            await interaction.followup.send("❌ Error: LobbyBot does not have permissions to manage channels.", ephemeral=True)
+            await interaction.followup.send("❌ Error: LobbyBot does not have permissions to manage server channels.", ephemeral=True)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
