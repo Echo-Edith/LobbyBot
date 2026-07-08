@@ -1,5 +1,5 @@
 discord.py
-flask
 yt-dlp
 spotipy
 PyNaCl
+Flask
