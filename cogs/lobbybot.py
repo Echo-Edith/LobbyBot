@@ -52,7 +52,6 @@ class LobbyBot(commands.Cog):
         cursor.execute("PRAGMA table_info(ephemeral_vcs)")
         evc_columns = [col[1] for col in cursor.fetchall()]
         if "creator_id" not in evc_columns:
-            # Recreate with extended metadata tracking for proper logging metrics
             cursor.execute("DROP TABLE IF EXISTS ephemeral_vcs")
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS ephemeral_vcs (
@@ -138,14 +137,12 @@ class LobbyBot(commands.Cog):
     # LOGGING CHANNELS SETUP & RECOVERY ENGINE
     # ==========================================================
     async def resolve_log_channel(self, guild: discord.Guild) -> discord.TextChannel:
-        """Looks up config database, falls back to scanning existing text channels named 'lobbybot-logs'."""
         saved_id = self.get_log_channel(guild.id)
         if saved_id:
             chan = guild.get_channel(saved_id)
             if chan:
                 return chan
 
-        # Search existing channels dynamically if DB entry is deleted or missing
         for channel in guild.text_channels:
             if channel.name == "lobbybot-logs":
                 self.save_log_channel(guild.id, channel.id)
@@ -274,13 +271,18 @@ class LobbyBot(commands.Cog):
         clean_limit = max(0, min(99, user_limit))
 
         try:
+            # Overwrite permissions so the bot ALWAYS has connect bypass (ignores the user limit)
+            overwrites = {
+                guild.me: discord.PermissionOverwrite(connect=True, speak=True, mute_members=True, move_members=True)
+            }
+            
             new_vc = await guild.create_voice_channel(
                 name=name.strip(),
                 user_limit=clean_limit,
+                overwrites=overwrites,
                 reason=f"Ephemeral VC requested by {interaction.user.name}"
             )
             
-            # Record tracking metadata directly to tracking database
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
             cursor.execute(
@@ -290,7 +292,6 @@ class LobbyBot(commands.Cog):
             conn.commit()
             conn.close()
             
-            # Formulate EXACT image UI layout match
             embed = discord.Embed(
                 title="🔊 Ephemeral Voice Channel Opened!",
                 description="A new dynamic room has been established.",
@@ -312,6 +313,50 @@ class LobbyBot(commands.Cog):
             await interaction.followup.send("❌ Error: LobbyBot does not have permissions to manage server channels.", ephemeral=True)
 
     # ==========================================================
+    # DYNAMIC USER LIMIT ADJUSTER (Prefix !limit Only)
+    # ==========================================================
+    async def adjust_vc_limit(self, guild, user, current_channel, new_limit: int):
+        """Internal logic to change VC limit if sender is the creator or an admin."""
+        if not current_channel or not isinstance(current_channel, discord.VoiceChannel):
+            return "❌ Error: You must be inside your ephemeral voice channel to adjust its limit!"
+
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT creator_id FROM ephemeral_vcs WHERE channel_id = ?', (current_channel.id,))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return "❌ Error: This voice channel is not managed by LobbyBot."
+
+        creator_id = row[0]
+        is_admin = user.guild_permissions.administrator or user.id == guild.owner_id
+
+        if user.id != creator_id and not is_admin:
+            return "❌ Permission Denied: Only the creator of this channel or an Administrator can adjust the limit."
+
+        clean_limit = max(0, min(99, new_limit))
+        
+        try:
+            # Dynamically ensure bot retains absolute connect permission override (ignores any set limits like 1)
+            await current_channel.set_permissions(guild.me, connect=True, speak=True)
+            await current_channel.edit(user_limit=clean_limit)
+            limit_text = "Unlimited" if clean_limit == 0 else f"{clean_limit} users"
+            return f"✅ Success! **{current_channel.name}** user limit adjusted to **{limit_text}**."
+        except discord.Forbidden:
+            return "❌ Error: LobbyBot does not have permissions to edit this voice channel's settings."
+
+    @commands.command(name="limit")
+    async def limit_prefix(self, ctx: commands.Context, user_limit: int = None):
+        """Prefix command: !limit [number]"""
+        if user_limit is None:
+            return await ctx.send("❌ Usage: `!limit <number>` (e.g. `!limit 5` or `!limit 0` for unlimited)")
+        
+        user_vc = ctx.author.voice.channel if ctx.author.voice else None
+        response_msg = await self.adjust_vc_limit(ctx.guild, ctx.author, user_vc, user_limit)
+        await ctx.send(response_msg)
+
+    # ==========================================================
     # COMPREHENSIVE UTILITY COMMANDS: /system-stats, /help, /changelogs
     # ==========================================================
     @app_commands.command(name="system-stats", description="Displays active latency and bot host metrics.")
@@ -327,19 +372,49 @@ class LobbyBot(commands.Cog):
         embed.set_footer(text="LobbyBot • Active Diagnostics Core")
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="help", description="Explains exactly how to configure and use the bot.")
+    @app_commands.command(name="help", description="Explains exactly how to configure and use the bot's features.")
     async def help_command(self, interaction: discord.Interaction):
         embed = discord.Embed(
-            title="❓ LobbyBot Help & Commands Documentation",
-            description="LobbyBot handles dynamic channel lifetimes with ease. Here is how you can utilize it:",
+            title="❓ LobbyBot Help & Command Index",
+            description="LobbyBot handles dynamic voice channels and high-fidelity music playback.\nHere is the full index of all commands organized by prefix type:",
             color=discord.Color.gold()
         )
-        embed.add_field(name="🔊 `/open-vc`", value="Creates a temporary, self-deleting voice room. Options include customized room names and member maximums.", inline=False)
-        embed.add_field(name="🛡️ `/restrict-vc` [Admin]", value="Sets channel permissions to either: everyone, administrators, or custom whitelisted roles (supports up to 4).", inline=False)
-        embed.add_field(name="📁 `/setup-logs` [Admin]", value="Initializes an isolated private logs channel for tracking VC creation details, joined counts, and session lifetimes.", inline=False)
-        embed.add_field(name="📋 `/changelogs`", value="Queries the centralized server updates system for active version changelogs.", inline=False)
-        embed.add_field(name="📊 `/system-stats`", value="Exposes bot uptime analytics and API websocket speeds.", inline=False)
-        embed.set_footer(text="LobbyBot • Built for performance.")
+        
+        # Slash Commands Section
+        slash_commands_list = (
+            "🔊 **/open-vc** `[name] [limit]`\n"
+            "└ *Creates a temporary, self-deleting voice room.*\n"
+            "🛡️ **/restrict-vc** `[mode] [roles...]` `[Admin]`\n"
+            "└ *Configures permission levels for opening new temporary VCs.*\n"
+            "📁 **/setup-logs** `[Admin]`\n"
+            "└ *Initializes a private logs channel to track VC creations and lifespans.*\n"
+            "📋 **/changelogs**\n"
+            "└ *Lists the latest live updates for LobbyBot directly from configuration stream.*\n"
+            "📊 **/system-stats**\n"
+            "└ *Exposes active connection latency, bot uptime, and server count.*\n"
+            "❓ **/help**\n"
+            "└ *Displays this comprehensive interactive command guide.*"
+        )
+        embed.add_field(name="✨ Slash Commands (/) ", value=slash_commands_list, inline=False)
+        
+        # Prefix Commands Section
+        prefix_commands_list = (
+            "👥 **!limit** `<number>`\n"
+            "└ *Edits user limit of the current VC. (Must be the VC Creator or an Admin).*\n"
+            "🎵 **!mp** `<song name / Spotify Link>` (or `!play`)\n"
+            "└ *Searches and plays/queues music track in your voice channel.*\n"
+            "📋 **!mq** (or `!queue`)\n"
+            "└ *Shows the current playlist queue, active song progress, and queue wait times.*\n"
+            "⏭️ **!mskip** (or `!skip`)\n"
+            "└ *Starts a democratic vote (needs 50% of VC users) to skip the song.*\n"
+            "⏹️ **!mstop** (or `!stop`)\n"
+            "└ *Completely wipes the music queue and disconnects the bot from the VC.*"
+        )
+        embed.add_field(name="⚙️ Prefix Commands (!)", value=prefix_commands_list, inline=False)
+        
+        embed.set_footer(text="LobbyBot • Premium Voice & Music Management")
+        if interaction.user.display_avatar:
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="changelogs", description="Lists the latest live updates for LobbyBot directly from configuration stream.")
@@ -353,13 +428,11 @@ class LobbyBot(commands.Cog):
             color=discord.Color.gold()
         )
         
-        # Pull latest message from tracking channel dynamically to ensure automatic delete/edit works!
         if not target_channel:
             embed.description = "❌ No active changelogs are available at this time. (System source unreachable)"
             return await interaction.followup.send(embed=embed)
 
         try:
-            # Look up last message published in the specific channel
             latest_msg = None
             async for msg in target_channel.history(limit=1):
                 latest_msg = msg
@@ -382,7 +455,6 @@ class LobbyBot(commands.Cog):
         if before.channel == after.channel:
             return
 
-        # Track unique user joins to the voice room
         if after.channel:
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
@@ -393,7 +465,6 @@ class LobbyBot(commands.Cog):
             conn.commit()
             conn.close()
 
-        # Handle channel cleanup on departure
         if before.channel:
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
@@ -407,7 +478,6 @@ class LobbyBot(commands.Cog):
                 creator_id, created_at, members_count = row
                 duration_mins = round((time.time() - created_at) / 60, 2)
                 
-                # Retrieve log channel securely
                 log_chan = await self.resolve_log_channel(before.channel.guild)
                 if log_chan:
                     log_embed = discord.Embed(
