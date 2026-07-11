@@ -1,5 +1,6 @@
 import sqlite3
 import random
+import re
 import discord
 import time
 from discord import app_commands
@@ -14,6 +15,9 @@ class LobbyBot(commands.Cog):
         self.start_time = time.time()
         self.init_db()
         self.cycle_status.start()
+        
+        # Schedule the clean sweep of any leftover empty VCs on startup
+        self.bot.loop.create_task(self.cleanup_ghost_vcs())
 
     def cog_unload(self):
         self.cycle_status.cancel()
@@ -143,6 +147,49 @@ class LobbyBot(commands.Cog):
         row = cursor.fetchone()
         conn.close()
         return row[0] if row else 0
+
+    # ==========================================================
+    # SECURE GHOST CHANNELS STARTUP CLEANER
+    # ==========================================================
+    async def cleanup_ghost_vcs(self):
+        """Sweeps database records and deletes empty VCs ONLY if they are found in the ephemeral_vcs table."""
+        await self.bot.wait_until_ready()
+        print("🧹 Initializing ephemeral voice channel sweep sequence...")
+        
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT channel_id, guild_id FROM ephemeral_vcs')
+        rows = cursor.fetchall()
+        conn.close()
+
+        to_delete_from_db = []
+        for channel_id, guild_id in rows:
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                to_delete_from_db.append(channel_id)
+                continue
+                
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                to_delete_from_db.append(channel_id)
+                continue
+                
+            # DOUBLE CHECK: Only delete empty channels that are confirmed bot-created
+            if len(channel.members) == 0:
+                try:
+                    await channel.delete(reason="LobbyBot: Clean sweep of ghost channels on startup.")
+                    print(f"🧹 Cleaned up expired dynamic voice room: '{channel.name}'")
+                except Exception as e:
+                    print(f"⚠️ Failed to delete ephemeral channel {channel_id}: {e}")
+                to_delete_from_db.append(channel_id)
+
+        if to_delete_from_db:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.executemany('DELETE FROM ephemeral_vcs WHERE channel_id = ?', [(cid,) for cid in to_delete_from_db])
+            conn.commit()
+            conn.close()
+            print(f"🧹 Removed {len(to_delete_from_db)} expired channel records from database.")
 
     # ==========================================================
     # BOT PRESENCE CONTROL LOOP
@@ -282,9 +329,18 @@ class LobbyBot(commands.Cog):
     )
     @app_commands.describe(
         name="The name of your custom voice channel.",
-        user_limit="The max number of members allowed in this VC (0 for unlimited, max 99)."
+        user_limit="The max number of members allowed in this VC (0 for unlimited, max 99).",
+        description="Welcome description topic displayed in the broadcast notification card.",
+        roles_allowed="Tag roles or enter names/IDs that are allowed to enter (supports multiple/infinite spacing)."
     )
-    async def open_vc_command(self, interaction: discord.Interaction, name: str, user_limit: int = 0):
+    async def open_vc_command(
+        self, 
+        interaction: discord.Interaction, 
+        name: str, 
+        user_limit: int = 0,
+        description: str = None,
+        roles_allowed: str = None
+    ):
         guild = interaction.guild
         await interaction.response.defer(ephemeral=True)
 
@@ -306,11 +362,45 @@ class LobbyBot(commands.Cog):
 
         clean_limit = max(0, min(99, user_limit))
 
+        # Dynamic Infinite Roles Extraction and Resolution
+        allowed_roles = []
+        if roles_allowed:
+            # 1. Parse pinged role mentions: <@&ID>
+            for r_id in re.findall(r'<@&(\d+)>', roles_allowed):
+                resolved_role = guild.get_role(int(r_id))
+                if resolved_role and resolved_role not in allowed_roles:
+                    allowed_roles.append(resolved_role)
+            
+            # 2. Parse raw numeric snowflakes
+            for r_id in re.findall(r'\b\d{17,21}\b', roles_allowed):
+                resolved_role = guild.get_role(int(r_id))
+                if resolved_role and resolved_role not in allowed_roles:
+                    allowed_roles.append(resolved_role)
+
+            # 3. Fallback name matching (case insensitive, ignoring pings)
+            clean_names = re.sub(r'<@&\d+>', '', roles_allowed).strip()
+            if clean_names:
+                for role in guild.roles:
+                    if role.is_default():
+                        continue
+                    # Match words within name
+                    if re.search(r'\b' + re.escape(role.name) + r'\b', clean_names, re.IGNORECASE):
+                        if role not in allowed_roles:
+                            allowed_roles.append(role)
+
         try:
-            # Overwrite permissions so the bot ALWAYS has connect bypass (ignores the user limit)
+            # Initialize permission overwrites
+            # Bot and Creator must always have Connect bypasses to prevent lockout
             overwrites = {
-                guild.me: discord.PermissionOverwrite(connect=True, speak=True, mute_members=True, move_members=True)
+                guild.me: discord.PermissionOverwrite(connect=True, speak=True, mute_members=True, move_members=True, view_channel=True),
+                interaction.user: discord.PermissionOverwrite(connect=True, speak=True, view_channel=True)
             }
+            
+            # If specific roles are configured, restrict everyone else from connecting
+            if allowed_roles:
+                overwrites[guild.default_role] = discord.PermissionOverwrite(connect=False)
+                for role in allowed_roles:
+                    overwrites[role] = discord.PermissionOverwrite(connect=True, view_channel=True)
             
             new_vc = await guild.create_voice_channel(
                 name=name.strip(),
@@ -336,9 +426,17 @@ class LobbyBot(commands.Cog):
                 description="A new dynamic room has been established.",
                 color=discord.Color.gold()
             )
-            embed.add_field(name="👑 Creator", value=interaction.user.mention, inline=False)
-            embed.add_field(name="🏷️ Channel Name", value=f"**{new_vc.name}**", inline=False)
-            embed.add_field(name="👥 Capacity Limit", value="Unlimited" if clean_limit == 0 else f"{clean_limit}", inline=False)
+            embed.add_field(name="👑 Creator", value=interaction.user.mention, inline=True)
+            embed.add_field(name="🏷️ Channel Name", value=f"**{new_vc.name}**", inline=True)
+            embed.add_field(name="👥 Capacity Limit", value="Unlimited" if clean_limit == 0 else f"{clean_limit}", inline=True)
+            
+            if description:
+                embed.add_field(name="📝 Channel Description", value=description, inline=False)
+                
+            if allowed_roles:
+                role_mentions = [r.mention for r in allowed_roles]
+                embed.add_field(name="🔒 Restricted Access Roles", value=", ".join(role_mentions), inline=False)
+                
             embed.add_field(name="🔗 Quick Join", value=f"[Click Here to Join Room]({new_vc.jump_url})", inline=False)
             embed.set_footer(text="This channel will automatically self-destruct once empty.")
             
@@ -540,6 +638,7 @@ class LobbyBot(commands.Cog):
             )
             row = cursor.fetchone()
             
+            # Delete if channel is empty and tracked in database (guarantees Admin VCs are never touched)
             if row and len(before.channel.members) == 0:
                 creator_id, created_at, members_count = row
                 duration_mins = round((time.time() - created_at) / 60, 2)
@@ -563,8 +662,9 @@ class LobbyBot(commands.Cog):
                 
                 try:
                     await before.channel.delete(reason="LobbyBot: Dynamic session empty.")
-                except Exception:
-                    pass
+                    print(f"🧹 Safely deleted expired dynamic channel '{before.channel.name}' from server view.")
+                except Exception as e:
+                    print(f"⚠️ Failed to delete expired channel {before.channel.id}: {e}")
                     
                 cursor.execute('DELETE FROM ephemeral_vcs WHERE channel_id = ?', (before.channel.id,))
                 
