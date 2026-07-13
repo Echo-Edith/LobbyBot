@@ -69,6 +69,14 @@ class LobbyBot(commands.Cog):
                 joined_at REAL
             )
         ''')
+
+        # New user preferences table for direct message opt-outs
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_dm_preferences (
+                user_id INTEGER PRIMARY KEY,
+                dms_enabled INTEGER DEFAULT 1
+            )
+        ''')
         
         # Safe structural database update check
         cursor.execute("PRAGMA table_info(vc_config)")
@@ -151,6 +159,35 @@ class LobbyBot(commands.Cog):
         row = cursor.fetchone()
         conn.close()
         return row[0] if row else 0
+
+    # User DM Preferences Managers
+    def toggle_user_dm_pref(self, user_id):
+        """Toggles the user's opt-in/opt-out status for DM announcements."""
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT dms_enabled FROM user_dm_preferences WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        if row is None:
+            new_val = 0  # Default was True, toggle to False
+        else:
+            new_val = 1 if row[0] == 0 else 0
+            
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_dm_preferences (user_id, dms_enabled)
+            VALUES (?, ?)
+        ''', (user_id, new_val))
+        conn.commit()
+        conn.close()
+        return new_val
+
+    def are_dms_enabled(self, user_id):
+        """Checks if a specific user has DM announcements toggled ON."""
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT dms_enabled FROM user_dm_preferences WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] == 1 if row else True  # Defaults to True (enabled)
 
     # ==========================================================
     # SECURE GHOST CHANNELS STARTUP CLEANER
@@ -330,6 +367,33 @@ class LobbyBot(commands.Cog):
             await interaction.followup.send("❌ Access Denied: LobbyBot requires administrator authority to manage channel states.", ephemeral=True)
 
     # ==========================================================
+    # DIRECT MESSAGE PREFERENCE TOGGLE COMMAND
+    # ==========================================================
+    @app_commands.command(
+        name="toggle-dms",
+        description="Turn LobbyBot direct message announcements ON or OFF."
+    )
+    async def toggle_dms_command(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        new_state = self.toggle_user_dm_pref(interaction.user.id)
+        
+        if new_state == 1:
+            embed = discord.Embed(
+                title="🔔 DM Notifications Enabled",
+                description="You will now receive direct messages when global announcements are published!",
+                color=discord.Color.green()
+            )
+        else:
+            embed = discord.Embed(
+                title="🔕 DM Notifications Disabled",
+                description="You will no longer receive direct message announcements from LobbyBot.",
+                color=discord.Color.red()
+            )
+            
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ==========================================================
     # CORE /RESTRICT-VC PERMISSIONS CONFIGURATION
     # ==========================================================
     @app_commands.command(
@@ -375,6 +439,20 @@ class LobbyBot(commands.Cog):
         
         allowed_roles_str = ",".join(collected_ids)
         self.save_vc_config(guild.id, mode.value, allowed_roles_str)
+
+        # Send configuration log to `#lobbybot-logs`
+        log_chan = await self.resolve_log_channel(guild)
+        if log_chan:
+            log_embed = discord.Embed(
+                title="🔒 VC Restrictions Updated",
+                description=f"Command access mode set to **{mode.name}**.",
+                color=discord.Color.orange()
+            )
+            log_embed.add_field(name="👥 Roles Allowed", value=", ".join(role_mentions) if role_mentions else "None", inline=False)
+            try:
+                await log_chan.send(embed=log_embed)
+            except Exception:
+                pass
 
         msg = f"✅ Success! `/open-vc` access has been configured to: **{mode.name}**"
         if role_mentions:
@@ -575,6 +653,22 @@ class LobbyBot(commands.Cog):
             await current_channel.set_permissions(guild.me, connect=True, speak=True)
             await current_channel.edit(user_limit=clean_limit)
             limit_text = "Unlimited" if clean_limit == 0 else f"{clean_limit} users"
+
+            # Audit limit adjustment in `#lobbybot-logs`
+            log_chan = await self.resolve_log_channel(guild)
+            if log_chan:
+                log_embed = discord.Embed(
+                    title="⚙️ Ephemeral Voice Channel Adjusted",
+                    description=f"User limit for channel **{current_channel.name}** was changed.",
+                    color=discord.Color.blue()
+                )
+                log_embed.add_field(name="👤 Adjuster", value=user.mention, inline=True)
+                log_embed.add_field(name="📏 New Limit", value="Unlimited" if clean_limit == 0 else f"`{clean_limit}`", inline=True)
+                try:
+                    await log_chan.send(embed=log_embed)
+                except Exception:
+                    pass
+
             return f"✅ Success! **{current_channel.name}** user limit adjusted to **{limit_text}**."
         except discord.Forbidden:
             return "❌ Error: LobbyBot does not have permissions to edit this voice channel's settings."
@@ -615,7 +709,7 @@ class LobbyBot(commands.Cog):
         if message.author.bot:
             return
 
-        # LIVE CONSOLE TELEMETRY Sweep: Debugging active channel entries on message events
+        # Debug console tracking
         print(f"[LobbyBot Debug] Message processed in channel: {message.channel.id} by {message.author}")
 
         # Account for dynamic parent thread channel ID tracking
@@ -635,7 +729,7 @@ class LobbyBot(commands.Cog):
 
             print(f"📢 Global Player Broadcast triggered by {message.author} inside target channel.")
 
-            # Create a premium announcement notification card
+            # Create a premium announcement notification card (Exactly matching what you write!)
             embed = discord.Embed(
                 title="📢 LobbyBot Global Announcement",
                 description=message.content,
@@ -646,13 +740,33 @@ class LobbyBot(commands.Cog):
                 name=message.author.display_name, 
                 icon_url=message.author.display_avatar.url if message.author.display_avatar else None
             )
-            embed.set_footer(text="LobbyBot Broadcast Network • You received this as a player/member.")
+            embed.set_footer(text="LobbyBot Broadcast Network • You can opt-out by running /toggle-dms.")
 
             if message.attachments:
                 embed.set_image(url=message.attachments[0].url)
 
-            # Collect all unique human members that share the same servers as LobbyBot
-            unique_players = {m for m in self.bot.get_all_members() if not m.bot}
+            # Audit Broadcast action in `#lobbybot-logs`
+            if message.guild:
+                log_chan = await self.resolve_log_channel(message.guild)
+                if log_chan:
+                    log_embed = discord.Embed(
+                        title="📢 Global Broadcast Outflow",
+                        description=f"A global notification has been dispatched by {message.author.mention}.",
+                        color=discord.Color.gold()
+                    )
+                    try:
+                        await log_chan.send(embed=log_embed)
+                    except Exception:
+                        pass
+
+            # Collect all unique human members that share the same servers as LobbyBot AND have DMs enabled
+            unique_players = set()
+            for guild in self.bot.guilds:
+                for member in guild.members:
+                    if not member.bot:
+                        # Check dynamic user DM preference in SQLite
+                        if self.are_dms_enabled(member.id):
+                            unique_players.add(member)
 
             print(f"🚀 Sending direct announcements to {len(unique_players)} players...")
 
