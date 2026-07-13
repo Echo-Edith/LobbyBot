@@ -20,6 +20,9 @@ class LobbyBot(commands.Cog):
         
         # Schedule the clean sweep of any leftover empty VCs on startup
         self.bot.loop.create_task(self.cleanup_ghost_vcs())
+        
+        # Schedule the historical log scan to restore the VC counts automatically
+        self.bot.loop.create_task(self.sync_stats_from_logs())
 
     def cog_unload(self):
         self.cycle_status.cancel()
@@ -192,6 +195,64 @@ class LobbyBot(commands.Cog):
             conn.commit()
             conn.close()
             print(f"🧹 Removed {len(to_delete_from_db)} expired channel records from database.")
+
+    # ==========================================================
+    # HISTORICAL LOG SCANNER & RECOVERY ENGINE
+    # ==========================================================
+    async def sync_stats_from_logs(self):
+        """Scans all lobby logs channels across servers to recover total opened VCs without resetting."""
+        await self.bot.wait_until_ready()
+        print("🔍 Starting historical log audit sequence...")
+        
+        total_historical_creations = 0
+        
+        for guild in self.bot.guilds:
+            log_chan = await self.resolve_log_channel(guild)
+            if not log_chan:
+                continue
+                
+            try:
+                # Scans the last 10,000 logs in the channel history
+                async for message in log_chan.history(limit=10000):
+                    if message.author.id == self.bot.user.id and message.embeds:
+                        for embed in message.embeds:
+                            # We count either "Opened" or "Closed" to avoid double counting.
+                            # "Closed" represents all finished channels.
+                            if embed.title == "🧹 Ephemeral Voice Channel Closed":
+                                total_historical_creations += 1
+            except discord.Forbidden:
+                print(f"⚠️ Lacked history permissions in '{log_chan.name}' inside guild '{guild.name}'")
+            except Exception as e:
+                print(f"⚠️ Error occurred auditing guild '{guild.name}': {e}")
+
+        # Count currently active VCs currently tracked in the database to add to our total
+        active_vcs_count = 0
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM ephemeral_vcs')
+            active_vcs_count = cursor.fetchone()[0]
+            conn.close()
+        except Exception:
+            pass
+
+        scanned_total = total_historical_creations + active_vcs_count
+        db_stored_total = self.get_stat("total_opened_vcs")
+
+        # Keep whichever total is higher (handles db wipes or manual log channel deletions safely)
+        resolved_total = max(db_stored_total, scanned_total)
+
+        # Write corrected count to the SQLite database
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO stats_tracker (stat_key, stat_value)
+            VALUES (?, ?)
+        ''', ("total_opened_vcs", resolved_total))
+        conn.commit()
+        conn.close()
+
+        print(f"✅ History audit complete! Resolved permanent VC creation count: {resolved_total}")
 
     # ==========================================================
     # BOT PRESENCE CONTROL LOOP
@@ -423,6 +484,22 @@ class LobbyBot(commands.Cog):
             # Persistent Stat Increment Tracker for open-vc count
             self.increment_stat("total_opened_vcs")
             
+            # Audit Opening event directly in log channel
+            log_chan = await self.resolve_log_channel(guild)
+            if log_chan:
+                log_embed = discord.Embed(
+                    title="🔊 Ephemeral Voice Channel Opened",
+                    description="A new dynamic room has been established.",
+                    color=discord.Color.green()
+                )
+                log_embed.add_field(name="🏷️ Name", value=f"`{new_vc.name}`", inline=True)
+                log_embed.add_field(name="👑 Creator", value=interaction.user.mention, inline=True)
+                log_embed.add_field(name="👥 Capacity Limit", value="Unlimited" if clean_limit == 0 else f"`{clean_limit}`", inline=True)
+                if allowed_roles:
+                    role_mentions = [r.mention for r in allowed_roles]
+                    log_embed.add_field(name="🔒 Restricted Access", value=", ".join(role_mentions), inline=False)
+                await log_chan.send(embed=log_embed)
+
             embed = discord.Embed(
                 title="🔊 Ephemeral Voice Channel Opened!",
                 description="A new dynamic room has been established.",
